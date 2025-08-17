@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="hi">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Plot Locator -- Final (with Dismil)</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Turf for area/length/centroid -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    html,body{height:100%;margin:0}
+    #map{position:fixed; inset:0; background:#e9eef2}
+    .top-left{position:absolute; left:12px; top:10px; z-index:2000}
+    .top-right{position:absolute; right:12px; top:10px; z-index:2000}
+    .btn{ background:#0f172a; color:#fff; border:none; padding:8px 10px; border-radius:8px; cursor:pointer; box-shadow:0 6px 14px rgba(0,0,0,.18) }
+    .btn.outline{ background:#fff; color:#111; border:1px solid #ddd }
+    .sidebar{ position:absolute; left:12px; top:56px; z-index:2100; width:360px; max-width:92vw;
+      background:#fff; border-radius:10px; box-shadow:0 12px 30px rgba(0,0,0,.18);
+      transform:translateX(-110%); transition:transform .18s; overflow:hidden }
+    .sidebar.open{ transform:translateX(0) }
+    .sb-header{ padding:12px; background:#0b1220; color:#fff; font-weight:700 }
+    .sb-section{ padding:10px 12px; border-top:1px solid #eef2f7; display:flex; flex-direction:column; gap:8px }
+    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap }
+    .input{ flex:1; padding:8px; border:1px solid #ddd; border-radius:8px }
+    .hint{ font-size:13px; color:#5b6b73 }
+    .leaflet-left .leaflet-control-zoom{ margin-left:12px; top:50%; transform:translateY(-50%); position:fixed; z-index:1700 }
+    .plot-label{ pointer-events:none; transform:translate(-50%,-50%) }
+    .plot-label div{ background:rgba(255,255,255,0.95); padding:4px 8px; border-radius:6px; border:1px solid #eee; font-weight:700; color:#b71c1c }
+    .measure-label{ background:rgba(17,24,39,0.95); color:#fff; padding:6px 8px; border-radius:8px; font-size:13px }
+    .toast{ position:absolute; left:50%; top:12px; transform:translateX(-50%); z-index:2200;
+      background:#111827; color:#fff; padding:8px 12px; border-radius:8px; display:none }
+    @media (max-width:420px){ .sidebar{ width:94vw; left:6px } }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <div class="top-left">
+    <button id="menuBtn" class="btn" aria-label="Menu">☰ मेन्यू</button>
+  </div>
+  <div class="top-right" id="layerPlaceholder"></div>
+
+  <div id="sidebar" class="sidebar" aria-hidden="true">
+    <div class="sb-header">मैप विकल्प</div>
+
+    <div class="sb-section">
+      <div class="row">
+        <input id="plotInput" class="input" placeholder="प्लॉट नंबर डालें (उदा. 1493)">
+        <button id="searchBtn" class="btn">🔍</button>
+      </div>
+      <div class="row">
+        <button id="voiceBtn" class="btn outline">🎤</button>
+        <button id="togglePlotsBtn" class="btn">Plots: ON</button>
+      </div>
+      <div class="hint">खोज पर वह प्लॉट zoom होकर popup दिखेगा।</div>
+    </div>
+
+    <div class="sb-section">
+      <div class="row">
+        <button id="locateBtn" class="btn">📍 मेरी लोकेशन</button>
+        <button id="fitBtn" class="btn outline">🗺️ पूरा मैप</button>
+      </div>
+    </div>
+
+    <div class="sb-section">
+      <div class="row">
+        <div style="flex:1">Plot Labels</div>
+        <button id="toggleLabelsBtn" class="btn">ON</button>
+      </div>
+      <div class="row">
+        <div style="flex:1">TTS (बोलकर)</div>
+        <button id="speechToggle" class="btn">ON</button>
+      </div>
+    </div>
+
+    <div class="sb-section">
+      <div class="row">
+        <button id="startMeasureBtn" class="btn">📐 Start</button>
+        <button id="undoMeasureBtn" class="btn outline" disabled>↩ Undo</button>
+        <button id="finishMeasureBtn" class="btn" disabled>✔ Finish</button>
+        <button id="clearMeasureBtn" class="btn outline">Clear</button>
+      </div>
+      <div class="row">
+        <div style="flex:1">Area Units</div>
+        <select id="unitSelect" class="input" style="max-width:130px">
+          <option value="sqft">sq ft</option>
+          <option value="sqm">sq m</option>
+          <option value="acre">acre</option>
+          <option value="dismil">dismil</option>
+          <option value="bigha">बीघा</option>
+          <option value="kattha">कट्ठा</option>
+          <option value="dhur">धुर</option>
+          <option value="dhurki">धुरकी</option>
+        </select>
+      </div>
+      <div id="measureInfo" class="hint">Start → map पर क्लिक कर points जोड़ें।</div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const GEOJSON_URL = 'data.geojson';
+    const PLOT_PROP = 'Name'; // Adjust this if the GeoJSON property is different (e.g., 'plot_no')
+    const MAX_ZOOM = 21;
+
+    const toastEl = document.getElementById('toast');
+    function toast(msg, ms=1800){
+      toastEl.innerText = msg;
+      toastEl.style.display='block';
+      clearTimeout(window._t);
+      window._t = setTimeout(()=> toastEl.style.display='none', ms);
+    }
+    let speechOn = true;
+    function speak(text){
+      if (!speechOn) return;
+      if (!window.speechSynthesis) {
+        toast('TTS not supported');
+        return;
+      }
+      try {
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'hi-IN';
+        window.speechSynthesis.speak(u);
+      } catch (e) {
+        toast('TTS error');
+      }
+    }
+
+    let map, plotLayer, labelLayer;
+    let plotsVisible = true, labelsVisible = true;
+    let youMarker=null, highlightLayer=null;
+    let dataGeo=null;
+
+    // Measure state
+    let measuring=false, pts=[], markers=[], segLabels=[], preview=null, resultLabel=null;
+
+    initMap();
+    function initMap(){
+      map = L.map('map', { maxZoom: MAX_ZOOM, zoomControl:true }).setView([25.339365,85.765942], 18);
+
+      const googleSat = L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+        maxZoom: MAX_ZOOM, subdomains:['mt0','mt1','mt2','mt3'], attribution:'© Google'
+      }).addTo(map);
+      const esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        maxZoom: MAX_ZOOM, attribution:'© Esri'
+      });
+      L.control.layers({ "Google Satellite": googleSat, "Esri Satellite": esriSat }, null, { position:'topright' }).addTo(map);
+
+      plotLayer = L.geoJSON(null, { style: f=>({ color:'#ff9800', weight:1.6, fillOpacity:0.12 }), onEachFeature }).addTo(map);
+      labelLayer = L.layerGroup().addTo(map);
+
+      fetch(GEOJSON_URL).then(r=>r.json()).then(j=>{
+        dataGeo = j; 
+        plotLayer.addData(j); 
+        buildLabels(j);
+        const b = plotLayer.getBounds(); 
+        if(b.isValid()) map.fitBounds(b,{padding:[20,20]});
+        toast('Plots loaded');
+        // Debug: Log available plot numbers
+        console.log('Available plot numbers:', j.features.map(f => f.properties[PLOT_PROP]));
+      }).catch(e => {
+        console.error('GeoJSON load error:', e);
+        toast('Failed to load plots');
+      });
+
+      document.getElementById('menuBtn').addEventListener('click', ()=>{
+        document.getElementById('sidebar').classList.toggle('open');
+      });
+      document.getElementById('toggleLabelsBtn').addEventListener('click', e=>{
+        labelsVisible=!labelsVisible; 
+        if(labelsVisible){ map.addLayer(labelLayer); e.target.innerText='ON'; } 
+        else { map.removeLayer(labelLayer); e.target.innerText='OFF'; }
+      });
+      document.getElementById('speechToggle').addEventListener('click', e=>{
+        speechOn=!speechOn; 
+        e.target.innerText = speechOn?'ON':'OFF';
+      });
+      document.getElementById('togglePlotsBtn').addEventListener('click', e => {
+        plotsVisible = !plotsVisible;
+        if (plotsVisible) {
+          map.addLayer(plotLayer);
+          e.target.innerText = 'Plots: ON';
+          toast('Plots enabled');
+          speak('प्लॉट्स चालू');
+        } else {
+          map.removeLayer(plotLayer);
+          e.target.innerText = 'Plots: OFF';
+          toast('Plots disabled');
+          speak('प्लॉट्स बंद');
+        }
+      });
+      document.getElementById('startMeasureBtn').addEventListener('click', startMeasure);
+      document.getElementById('undoMeasureBtn').addEventListener('click', undoLast);
+      document.getElementById('finishMeasureBtn').addEventListener('click', finishMeasure);
+      document.getElementById('clearMeasureBtn').addEventListener('click', ()=> clearMeasure(true));
+      document.getElementById('locateBtn').addEventListener('click', () => {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            const { latitude, longitude } = pos.coords;
+            map.setView([latitude, longitude], 18);
+            if (youMarker) map.removeLayer(youMarker);
+            youMarker = L.marker([latitude, longitude]).addTo(map).bindPopup('आप यहाँ हैं').openPopup();
+            toast('Location found');
+            speak('आपकी लोकेशन मिली');
+          },
+          () => {
+            toast('Unable to get location');
+            speak('लोकेशन नहीं मिली');
+          }
+        );
+      });
+      document.getElementById('searchBtn').addEventListener('click', () => {
+        const plotNo = document.getElementById('plotInput').value.trim().toLowerCase();
+        if (!plotNo) {
+          toast('Please enter a plot number');
+          speak('कृपया प्लॉट नंबर डालें');
+          return;
+        }
+        if (!dataGeo) {
+          toast('Plots not loaded yet');
+          speak('प्लॉट्स अभी लोड नहीं हुए');
+          return;
+        }
+        const feature = dataGeo.features.find(f => {
+          const props = f.properties || {};
+          return (
+            (props[PLOT_PROP]?.toString().toLowerCase() === plotNo) ||
+            (props['plot_no']?.toString().toLowerCase() === plotNo) ||
+            (props['PlotNumber']?.toString().toLowerCase() === plotNo) ||
+            (props['name']?.toString().toLowerCase() === plotNo)
+          );
+        });
+        if (feature) {
+          if (highlightLayer) map.removeLayer(highlightLayer);
+          highlightLayer = L.geoJSON(feature, {
+            style: { color: '#ff0000', weight: 3, fillOpacity: 0.3 }
+          }).addTo(map);
+          map.fitBounds(highlightLayer.getBounds(), { padding: [20, 20] });
+          const area_m2 = turf.area(feature);
+          const centroid = turf.centroid(feature).geometry.coordinates;
+          const googleMapsLink = `https://www.google.com/maps?q=${centroid[1]},${centroid[0]}`;
+          highlightLayer.bindPopup(`
+            <b>Plot:</b> ${plotNo}<br>
+            ${formatArea(area_m2)}<br>
+            <a href="${googleMapsLink}" target="_blank">Open in Google Maps</a>
+          `).openPopup();
+          toast(`Plot ${plotNo} found`);
+          speak(`प्लॉट ${plotNo} मिला`);
+        } else {
+          toast(`Plot ${plotNo} not found`);
+          speak(`प्लॉट ${plotNo} नहीं मिला`);
+          console.log('GeoJSON features:', dataGeo.features.map(f => f.properties));
+        }
+      });
+      document.getElementById('voiceBtn').addEventListener('click', () => {
+        if (!window.SpeechRecognition && !window.webkitSpeechRecognition) {
+          toast('Voice input not supported');
+          speak('वॉयस इनपुट समर्थित नहीं है');
+          return;
+        }
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = new SpeechRecognition();
+        recognition.lang = 'hi-IN';
+        recognition.onresult = (event) => {
+          const plotNo = event.results[0][0].transcript.trim();
+          document.getElementById('plotInput').value = plotNo;
+          document.getElementById('searchBtn').click();
+          toast(`Voice input: ${plotNo}`);
+          speak(`वॉयस इनपुट: ${plotNo}`);
+        };
+        recognition.onerror = () => {
+          toast('Voice input error');
+          speak('वॉयस इनपुट में त्रुटि');
+        };
+        recognition.start();
+      });
+      document.getElementById('fitBtn').addEventListener('click', () => {
+        if (!dataGeo) {
+          toast('Plots not loaded yet');
+          speak('प्लॉट्स अभी लोड नहीं हुए');
+          return;
+        }
+        const bounds = plotLayer.getBounds();
+        if (bounds.isValid()) {
+          map.fitBounds(bounds, { padding: [20, 20] });
+          toast('Map fitted to plots');
+          speak('मैप को प्लॉट्स के अनुसार फिट किया गया');
+        } else {
+          toast('No valid plot bounds');
+          speak('कोई वैध प्लॉट सीमा नहीं');
+        }
+      });
+
+      map.on('click', e => { if(!measuring) return; addMarkerAt(e.latlng); });
+    }
+
+    function onEachFeature(feature, layer){
+      const plotNo = feature?.properties?.[PLOT_PROP] ?? 'Unknown';
+      const area_m2 = turf.area(feature);
+      const popup = `<b>Plot:</b> ${plotNo}<br/>${formatArea(area_m2)}`;
+      layer.bindPopup(popup);
+    }
+    function buildLabels(geojson){
+      labelLayer.clearLayers();
+      (geojson.features||[]).forEach(f=>{
+        try{
+          const name = f?.properties?.[PLOT_PROP] ?? '';
+          const c = turf.centroid(f).geometry.coordinates;
+          const m = L.marker([c[1],c[0]], { icon: L.divIcon({ className:'plot-label', html:`<div>${name}</div>` }), interactive:false });
+          labelLayer.addLayer(m);
+        }catch(e){}
+      });
+    }
+
+    const startBtn = document.getElementById('startMeasureBtn');
+    const undoBtn = document.getElementById('undoMeasureBtn');
+    const finishBtn = document.getElementById('finishMeasureBtn');
+    const clearBtn = document.getElementById('clearMeasureBtn');
+    const measureInfo = document.getElementById('measureInfo');
+
+    function startMeasure(){
+      if(measuring) return;
+      measuring=true; clearMeasure(false);
+      measureInfo.innerText='Measure ON -- map पर क्लिक करें';
+      startBtn.disabled=true;
+      finishBtn.disabled=false;
+    }
+    function addMarkerAt(latlng){
+      const marker=L.marker([latlng.lat,latlng.lng],{draggable:true}).addTo(map);
+      const index=markers.length;
+      marker.on('drag', ev=>{
+        const pos=ev.target.getLatLng();
+        pts[index]=[pos.lng,pos.lat];
+        updatePreviewAndInfo();
+      });
+      markers.push(marker); pts.push([latlng.lng,latlng.lat]);
+      undoBtn.disabled=false;
+      updatePreviewAndInfo();
+    }
+    function undoLast(){
+      if(pts.length===0) return;
+      const m=markers.pop(); if(m) map.removeLayer(m);
+      pts.pop();
+      undoBtn.disabled=(pts.length===0);
+      updatePreviewAndInfo();
+    }
+    function finishMeasure(){
+      measuring=false;
+      startBtn.disabled=false;
+      finishBtn.disabled=true;
+      undoBtn.disabled=true;
+      measureInfo.innerText='Measurement finished -- Clear to reset';
+      if(pts.length>=3){
+        const ring=[...pts,pts[0]];
+        const poly=turf.polygon([ring]);
+        const area_m2=turf.area(poly);
+        speak(formatArea(area_m2, true));
+      }
+    }
+    function clearMeasure(full=true){
+      pts=[]; markers.forEach(m=>map.removeLayer(m)); markers=[];
+      if(preview) map.removeLayer(preview); preview=null;
+      if(resultLabel) map.removeLayer(resultLabel); resultLabel=null;
+      if(full){
+        measuring=false;
+        startBtn.disabled=false;
+        finishBtn.disabled=true;
+        undoBtn.disabled=true;
+        measureInfo.innerText='Start → map पर क्लिक कर points जोड़ें';
+      }
+    }
+
+    function formatArea(area_m2,forSpeech=false){
+      const sqft=area_m2*10.7639104167;
+      const acre=sqft/43560;
+      const dismil=acre*100;
+      const acreToKattha=32;
+      const katthaToBigha=1/20;
+      const katthaToDhur=20;
+      const dhurToDhurki=20;
+      const kattha=acre*acreToKattha;
+      const bigha=kattha*katthaToBigha;
+      const dhur=kattha*katthaToDhur;
+      const dhurki=dhur*dhurToDhurki;
+
+      const unit=document.getElementById('unitSelect').value;
+      let displayText;
+      if(unit==='sqm') displayText=`${area_m2.toFixed(2)} m²`;
+      else if(unit==='sqft') displayText=`${sqft.toFixed(1)} sq ft`;
+      else if(unit==='acre') displayText=`${acre.toFixed(4)} acre`;
+      else if(unit==='dismil') displayText=`${dismil.toFixed(2)} dismil`;
+      else if(unit==='bigha') displayText=`${bigha.toFixed(2)} बीघा`;
+      else if(unit==='kattha') displayText=`${kattha.toFixed(2)} कट्ठा`;
+      else if(unit==='dhur') displayText=`${dhur.toFixed(2)} धुर`;
+      else if(unit==='dhurki') displayText=`${dhurki.toFixed(2)} धुरकी`;
+
+      const allUnitsText=`
+        ${acre.toFixed(4)} एकड़<br>
+        ${dismil.toFixed(2)} डिसमिल<br>
+        ${bigha.toFixed(2)} बीघा<br>
+        ${kattha.toFixed(2)} कट्ठा<br>
+        ${dhur.toFixed(2)} धुर<br>
+        ${dhurki.toFixed(2)} धुरकी<br>
+        ${area_m2.toFixed(2)} m²<br>
+        ${sqft.toFixed(1)} sq ft
+      `;
+      if(forSpeech) return `${Math.round(dismil)} डिसमिल`;
+      return `<b>Area:</b><br>${allUnitsText}`;
+    }
+
+    function updatePreviewAndInfo(){
+      if(preview){ map.removeLayer(preview); preview=null; }
+      if(resultLabel){ map.removeLayer(resultLabel); resultLabel=null; }
+      if(pts.length>=3){
+        const ring=[...pts,pts[0]];
+        preview=L.polygon(ring.map(p=>[p[1],p[0]]),{color:'#ea580c',weight:2,fillOpacity:0.12}).addTo(map);
+        const poly=turf.polygon([ring]);
+        const area_m2=turf.area(poly);
+        const cent=turf.centroid(poly).geometry.coordinates;
+        resultLabel=L.marker([cent[1],cent[0]],{icon:L.divIcon({className:'measure-label',html:`Area: ${formatArea(area_m2)}`})}).addTo(map);
+        measureInfo.innerText=`Live Area: ${formatArea(area_m2)} -- Finish पर क्लिक करें`;
+      } else {
+        measureInfo.innerText=`Points: ${pts.length} -- Add ${3-pts.length} more point(s) for area`;
+      }
+    }
+  </script>
+</body>
+<style>html{
+ color:darkviolet;
+ font-size:25px;
+ font-weight:600;
+}
+</style><script>/*Here write your javascript code*/</script></html>
